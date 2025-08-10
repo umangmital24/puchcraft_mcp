@@ -3,11 +3,9 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import fetch from "node-fetch";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, HttpServerTransport } from "@modelcontextprotocol/sdk/server";
 
 import { z } from "zod";
-
-import { HttpServerTransport } from "@modelcontextprotocol/sdk/server/http.js";
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "openai/gpt-oss-20b"; // change if you use a different model
@@ -118,3 +116,4 @@ Format as:
     process.exit(1);
   }
 })();
+
