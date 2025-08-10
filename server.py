@@ -1,143 +1,106 @@
-import os
-import sys
 import asyncio
-import requests
+from typing import Annotated
+import os
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
+from mcp import ErrorData, McpError
+from mcp.server.auth.provider import AccessToken
+from mcp.types import INVALID_PARAMS
+from pydantic import Field
+from mcstatus import JavaServer
+import httpx
 
-from fastmcp import McpServer, Content
-from fastmcp.transport.http import HttpServerTransport
-
-# Load environment variables from a .env file
+# --- Load environment variables ---
 load_dotenv()
 
-# --- Constants ---
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama3-8b-8192" # Using a current Groq model
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TOKEN = os.environ.get("AUTH_TOKEN")
+MY_NUMBER = os.environ.get("MY_NUMBER")
 
-# --- Create MCP Server ---
-server = McpServer(
-    name="puchcraft-mcp-py",
-    version="1.0.0",
+assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
+assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
+
+# --- Auth Provider ---
+class SimpleBearerAuthProvider(BearerAuthProvider):
+    def __init__(self, token: str):
+        k = RSAKeyPair.generate()
+        super().__init__(public_key=k.public_key, jwks_uri=None, issuer=None, audience=None)
+        self.token = token
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        if token == self.token:
+            return AccessToken(
+                token=token,
+                client_id="puch-client",
+                scopes=["*"],
+                expires_at=None,
+            )
+        return None
+
+# --- Helper: DuckDuckGo Search ---
+async def google_search_links(query: str, num_results: int = 5) -> list[str]:
+    """Perform a DuckDuckGo search and return a list of URLs."""
+    ddg_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
+    links = []
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(ddg_url, headers={"User-Agent": "MinecraftServerFinder/1.0"})
+        if resp.status_code != 200:
+            return ["<error>Failed to perform search.</error>"]
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for a in soup.find_all("a", class_="result__a", href=True):
+        href = a["href"]
+        if "http" in href:
+            links.append(href)
+        if len(links) >= num_results:
+            break
+
+    return links or ["<error>No results found.</error>"]
+
+# --- MCP Server Setup ---
+mcp = FastMCP(
+    "Minecraft Server Finder MCP",
+    auth=SimpleBearerAuthProvider(TOKEN),
 )
 
-# --- Define Tool Input Schema ---
-class ServerStatusInput(BaseModel):
-    """Input schema for the get_server_status tool."""
-    server_ip: str
+# --- Tool: validate ---
+@mcp.tool
+async def validate() -> str:
+    return MY_NUMBER
 
-# --- Tool: get_server_status ---
-@server.tool(
-    name="get_server_status",
-    input_model=ServerStatusInput,
-    description="Gets the status of a Minecraft server. If it's offline, suggests alternatives."
-)
-async def get_server_status(params: ServerStatusInput) -> Content:
-    """
-    Checks Minecraft server status and provides alternatives if offline.
-    """
-    server_ip = params.server_ip
+# --- Tool: minecraft_server_finder ---
+@mcp.tool(description="Check Minecraft server status by IP/Domain, and suggest alternatives if offline.")
+async def minecraft_server_finder(
+    server_address: Annotated[str, Field(description="Minecraft server IP or domain")],
+    port: Annotated[int | None, Field(description="Port number, defaults to 25565")] = 25565
+) -> str:
     try:
-        # 1) Check server status via mcsrvstat.us
-        res = requests.get(f"https://api.mcsrvstat.us/2/{server_ip}")
-        res.raise_for_status()  # Raise an exception for bad status codes
-        data = res.json()
-
-        if data.get("online"):
-            # Server is online, return its details
-            players = data.get("players", {})
-            motd_lines = data.get("motd", {}).get("clean", ["N/A"])
-            return Content(
-                content=[
-                    {"type": "text", "text": f"Server {server_ip} is ONLINE."},
-                    {"type": "text", "text": f"Players: {players.get('online', 0)}/{players.get('max', 0)}"},
-                    {"type": "text", "text": f"MOTD: {' '.join(motd_lines)}"},
-                ],
-                metadata={"raw": data},
-            )
-
-        # 2) If offline, ask Groq for suggested alternatives
-        prompt = f"""
-You are PuchCraft AI, an expert on popular public Minecraft servers.
-A server is offline.
-
-Hostname: {server_ip}
-Please suggest 3 similar, active and popular Minecraft servers (Name — IP — 1-line reason each).
-Format as:
-1. Name — IP — Reason
-2. ...
-3. ...
-        """.strip()
-
-        groq_resp = requests.post(
-            GROQ_API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+        server = JavaServer.lookup(f"{server_address}:{port}")
+        status = server.status()
+        
+        return (
+            f"🎮 **Minecraft Server Status**\n"
+            f"🖥 Server: `{server_address}:{port}`\n"
+            f"✅ **Online**\n"
+            f"👥 Players: {status.players.online}/{status.players.max}\n"
+            f"📢 MOTD: {status.description}\n"
+            f"⏱ Latency: {status.latency} ms"
+        )
+    except Exception:
+        # If offline, suggest alternatives
+        alt_links = await google_search_links("public Minecraft servers list")
+        return (
+            f"❌ The server `{server_address}:{port}` appears to be **offline**.\n\n"
+            f"💡 **Here are some alternative servers:**\n" +
+            "\n".join(f"- {link}" for link in alt_links)
         )
 
-        if not groq_resp.ok:
-            # Handle Groq API errors
-            error_text = groq_resp.text
-            print(f"Groq error: {groq_resp.status_code}, {error_text}", file=sys.stderr)
-            return Content(
-                content=[
-                    {"type": "text", "text": f"Server {server_ip} is OFFLINE."},
-                    {"type": "text", "text": f"Unable to fetch alternatives from Groq (status {groq_resp.status_code})."},
-                ],
-                metadata={"mcsrv": data},
-            )
-
-        groq_json = groq_resp.json()
-        suggestions = groq_json.get("choices", [{}])[0].get("message", {}).get("content", "No suggestions returned.").strip()
-
-        return Content(
-            content=[
-                {"type": "text", "text": f"Server {server_ip} is OFFLINE."},
-                {"type": "text", "text": "Suggested alternatives:"},
-                {"type": "text", "text": suggestions},
-            ],
-            metadata={"mcsrv": data, "groq": groq_json},
-        )
-
-    except requests.RequestException as e:
-        print(f"Network error: {e}", file=sys.stderr)
-        return Content(
-            content=[{"type": "text", "text": f"Network error checking {server_ip}: {e}"}],
-            metadata={"error": str(e)},
-        )
-    except Exception as e:
-        print(f"Tool error: {e}", file=sys.stderr)
-        return Content(
-            content=[{"type": "text", "text": f"An unexpected error occurred while checking {server_ip}."}],
-            metadata={"error": str(e)},
-        )
-
-# --- Main execution block ---
+# --- Run MCP Server ---
 async def main():
-    """Sets up and runs the MCP server."""
-    port = int(os.getenv("PORT", 3000))
-    transport = HttpServerTransport(port=port, host="0.0.0.0")
-    try:
-        await server.connect(transport)
-        print(f"✅ MCP server running on http://0.0.0.0:{port}", file=sys.stderr)
-        # Keep the server running
-        while True:
-            await asyncio.sleep(3600)
-    except Exception as e:
-        print(f"❌ Failed to start MCP server: {e}", file=sys.stderr)
-        sys.exit(1)
+    print("🚀 Starting Minecraft Server Finder MCP on http://0.0.0.0:8086")
+    await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
 
 if __name__ == "__main__":
-    # Ensure you have a GROQ_API_KEY in your .env file or environment
-    if not GROQ_API_KEY:
-        print("❌ GROQ_API_KEY environment variable not set.", file=sys.stderr)
-        sys.exit(1)
-        
     asyncio.run(main())
