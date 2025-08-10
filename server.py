@@ -1,12 +1,10 @@
 import asyncio
-from typing import Annotated
 import os
+from typing import Annotated
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
-from mcp import ErrorData, McpError
 from mcp.server.auth.provider import AccessToken
-from mcp.types import INVALID_PARAMS
 from pydantic import Field
 from mcstatus import JavaServer
 import httpx
@@ -15,10 +13,13 @@ import httpx
 load_dotenv()
 
 TOKEN = os.environ.get("AUTH_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MY_NUMBER = os.environ.get("MY_NUMBER")
 
-assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
-assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
+assert TOKEN, "Please set AUTH_TOKEN in your .env file"
+assert GROQ_API_KEY, "Please set GROQ_API_KEY in your .env file"
+assert MY_NUMBER, "Please set MY_NUMBER in your .env file"
+
 
 # --- Auth Provider ---
 class SimpleBearerAuthProvider(BearerAuthProvider):
@@ -37,27 +38,30 @@ class SimpleBearerAuthProvider(BearerAuthProvider):
             )
         return None
 
-# --- Helper: DuckDuckGo Search ---
-async def google_search_links(query: str, num_results: int = 5) -> list[str]:
-    """Perform a DuckDuckGo search and return a list of URLs."""
-    ddg_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
-    links = []
 
+# --- Helper: Suggest Alternatives via Groq ---
+async def groq_suggest_alternatives() -> str:
+    """Ask Groq LLM for Minecraft server suggestions."""
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "mixtral-8x7b-32768",
+        "messages": [
+            {"role": "system", "content": "You suggest popular online Minecraft servers with IP addresses."},
+            {"role": "user", "content": "Suggest 5 popular Minecraft servers that are usually online, with their IP addresses."}
+        ],
+        "temperature": 0.7
+    }
     async with httpx.AsyncClient() as client:
-        resp = await client.get(ddg_url, headers={"User-Agent": "MinecraftServerFinder/1.0"})
-        if resp.status_code != 200:
-            return ["<error>Failed to perform search.</error>"]
+        resp = await client.post(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"]
+        else:
+            return f"⚠️ Error from Groq API: {resp.text}"
 
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for a in soup.find_all("a", class_="result__a", href=True):
-        href = a["href"]
-        if "http" in href:
-            links.append(href)
-        if len(links) >= num_results:
-            break
-
-    return links or ["<error>No results found.</error>"]
 
 # --- MCP Server Setup ---
 mcp = FastMCP(
@@ -65,10 +69,12 @@ mcp = FastMCP(
     auth=SimpleBearerAuthProvider(TOKEN),
 )
 
+
 # --- Tool: validate ---
 @mcp.tool
 async def validate() -> str:
     return MY_NUMBER
+
 
 # --- Tool: minecraft_server_finder ---
 @mcp.tool(description="Check Minecraft server status by IP/Domain, and suggest alternatives if offline.")
@@ -79,7 +85,6 @@ async def minecraft_server_finder(
     try:
         server = JavaServer.lookup(f"{server_address}:{port}")
         status = server.status()
-        
         return (
             f"🎮 **Minecraft Server Status**\n"
             f"🖥 Server: `{server_address}:{port}`\n"
@@ -89,18 +94,18 @@ async def minecraft_server_finder(
             f"⏱ Latency: {status.latency} ms"
         )
     except Exception:
-        # If offline, suggest alternatives
-        alt_links = await google_search_links("public Minecraft servers list")
+        suggestions = await groq_suggest_alternatives()
         return (
             f"❌ The server `{server_address}:{port}` appears to be **offline**.\n\n"
-            f"💡 **Here are some alternative servers:**\n" +
-            "\n".join(f"- {link}" for link in alt_links)
+            f"💡 **Here are some alternative servers:**\n{suggestions}"
         )
+
 
 # --- Run MCP Server ---
 async def main():
     print("🚀 Starting Minecraft Server Finder MCP on http://0.0.0.0:8086")
     await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
